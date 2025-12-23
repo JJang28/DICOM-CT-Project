@@ -1,0 +1,20 @@
+Face–CT Alignment Test Package
+
+Contents:
+- ct_dicom/        Original CT DICOM series
+- face_scan.ply    Phone-based 3D facial scan
+- ct_skin.stl      Skin surface extracted from CT
+- face_in_ct.stl   Facial scan aligned into CT space
+- alignment_metrics.csv   Quantitative alignment metrics
+- RESULT.txt       PASS/FAIL based on predefined criteria
+
+How to view in 3D Slicer:
+1. Open 3D Slicer
+2. Import ct_dicom as DICOM
+3. Load ct_skin.stl and face_in_ct.stl as models
+4. Enable 3D view to visually assess alignment
+
+Interpretation:
+- PASS indicates acceptable geometric alignment between
+  external facial surface and CT-derived skin.
+- FAIL indicates mismatch or insufficient alignment quality.
