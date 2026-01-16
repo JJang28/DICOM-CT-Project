@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""
+Face–CT Alignment: one-file runner for PI
+
+What it does (one command):
+- Reads a CT DICOM folder (auto-picks the series with the most slices)
+- Extracts a CT-derived skin surface (STL)
+- Aligns a phone-based face scan mesh into CT space (STL)
+- Writes metrics + PASS/FAIL into the case folder
+
+Expected case folder layout:
+cases/P001/
+  ct_dicom/        (CT DICOM series folder)
+  face_scan.ply    (phone face scan mesh; ply/obj/stl also usually works)
+
+Run:
+  python run_case.py --case cases/P001
+
+Outputs (written into the same case folder):
+  ct_skin.stl
+  face_in_ct.stl
+  alignment_metrics.csv
+  RESULT.txt
+
+Dependencies (pip):
+  numpy open3d SimpleITK pydicom scikit-image trimesh rtree
+
+Notes:
+- This is a research prototype intended for feasibility / workflow testing.
+- PASS/FAIL thresholds are conservative defaults and can be tuned.
+"""
+
+import argparse
+import csv
+import os
+from pathlib import Path
+
+import numpy as np
+import open3d as o3d
+import SimpleITK as sitk
+from skimage import measure
+import trimesh
+
+
+# ------------------------
+# Helpers
+# ------------------------
+def _bbox_diag_o3d(mesh: o3d.geometry.TriangleMesh) -> float:
+    bbox = mesh.get_axis_aligned_bounding_box()
+    return float(np.linalg.norm(bbox.get_extent()))
+
+
+def normalize_units_to_mm(mesh: o3d.geometry.TriangleMesh, name: str) -> o3d.geometry.TriangleMesh:
+    """
+    Heuristic unit normalization:
+      - if diagonal is tiny (<5) assume meters -> scale x1000
+      - if diagonal is small (5..50) assume cm -> scale x10
+      - else assume mm
+    """
+    d = _bbox_diag_o3d(mesh)
+    scale = 1.0
+    if 0 < d < 5.0:
+        scale = 1000.0
+    elif 5.0 <= d < 50.0:
+        scale = 10.0
+
+    if scale != 1.0:
+        mesh = o3d.geometry.TriangleMesh(mesh)
+        mesh.scale(scale, center=mesh.get_center())
+        print(f"[unit-fix] {name}: diag {d:.3f} -> x{scale}")
+    else:
+        print(f"[unit-fix] {name}: diag {d:.3f} assumed mm-ish")
+    return mesh
+
+
+def pick_best_series_id(dicom_dir: str) -> str:
+    """
+    Pick the DICOM series with the most slices. This avoids scouts or small series.
+    """
+    reader = sitk.ImageSeriesReader()
+    series_ids = reader.GetGDCMSeriesIDs(dicom_dir)
+    if not series_ids:
+        raise RuntimeError(f"No DICOM series found in: {dicom_dir}")
+
+    best_id = None
+    best_n = -1
+    for sid in series_ids:
+        n = len(reader.GetGDCMSeriesFileNames(dicom_dir, sid))
+        if n > best_n:
+            best_n = n
+            best_id = sid
+    assert best_id is not None
+    return best_id
+
+
+def extract_ct_skin_stl(
+    dicom_dir: str,
+    out_stl_path: str,
+    series_id: str | None = None,
+    hu_threshold: int = -500,
+) -> tuple[str, tuple[int, int, int], tuple[float, float, float]]:
+    """
+    Read a CT series and extract a rough 'skin surface' mesh using marching cubes
+    on a binary mask (HU > hu_threshold).
+
+    Returns: (series_id, volume_shape_zyx, spacing_xyz_mm)
+    """
+    reader = sitk.ImageSeriesReader()
+    if series_id is None:
+        series_id = pick_best_series_id(dicom_dir)
+
+    files = reader.GetGDCMSeriesFileNames(dicom_dir, series_id)
+    reader.SetFileNames(files)
+    img = reader.Execute()
+
+    # SimpleITK: spacing is (X,Y,Z); GetArrayFromImage gives array in (Z,Y,X)
+    spacing_xyz = img.GetSpacing()
+    origin_xyz = np.array(img.GetOrigin(), dtype=float)
+
+    arr_zyx = sitk.GetArrayFromImage(img).astype(np.int16)
+    print(f"[ct] using series {series_id}")
+    print(f"[ct] slices={arr_zyx.shape[0]} spacing(X,Y,Z)={spacing_xyz}")
+
+    # Binary mask (rough "body/skin" region)
+    mask_zyx = (arr_zyx > hu_threshold).astype(np.uint8)
+
+    # marching_cubes expects spacing in the same axis order as the array
+    # array is (Z,Y,X) so spacing should be (Z,Y,X) = (spacing_z, spacing_y, spacing_x)
+    verts_zyx, faces, _normals, _values = measure.marching_cubes(
+        mask_zyx,
+        level=0.5,
+        spacing=(spacing_xyz[2], spacing_xyz[1], spacing_xyz[0]),
+    )
+
+    # Convert verts from (Z,Y,X) to (X,Y,Z) and place into world coordinates with origin
+    verts_xyz = np.c_[verts_zyx[:, 2], verts_zyx[:, 1], verts_zyx[:, 0]] + origin_xyz
+
+    tm = trimesh.Trimesh(vertices=verts_xyz, faces=faces, process=True)
+    tm.export(out_stl_path)
+    print(f"[ct] wrote: {out_stl_path}")
+
+    return series_id, tuple(arr_zyx.shape), tuple(float(x) for x in spacing_xyz)
+
+
+def align_face_to_ct_skin(
+    face_mesh_path: str,
+    ct_skin_stl_path: str,
+    out_face_in_ct_stl: str,
+    sample_points: int = 60000,
+    icp_threshold_mm: float = 30.0,
+) -> dict:
+    """
+    Align face scan surface to CT-derived skin surface with ICP (point-to-plane).
+    Saves the aligned face mesh to out_face_in_ct_stl.
+    Returns metrics dict.
+    """
+    face = o3d.io.read_triangle_mesh(face_mesh_path)
+    ct = o3d.io.read_triangle_mesh(ct_skin_stl_path)
+    if face.is_empty():
+        raise RuntimeError(f"Face mesh is empty or unreadable: {face_mesh_path}")
+    if ct.is_empty():
+        raise RuntimeError(f"CT skin mesh is empty or unreadable: {ct_skin_stl_path}")
+
+    face = normalize_units_to_mm(face, "face")
+    ct = normalize_units_to_mm(ct, "ct_skin")
+
+    face.compute_vertex_normals()
+    ct.compute_vertex_normals()
+
+    src = face.sample_points_uniformly(number_of_points=sample_points)
+    tgt = ct.sample_points_uniformly(number_of_points=sample_points)
+
+    # coarse: center both
+    src.translate(-src.get_center())
+    tgt.translate(-tgt.get_center())
+
+    reg = o3d.pipelines.registration.registration_icp(
+        src,
+        tgt,
+        icp_threshold_mm,
+        np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+    )
+
+    # Apply transform to the centered point cloud for distance stats
+    src_aligned = o3d.geometry.PointCloud(src)
+    src_aligned.transform(reg.transformation)
+
+    d = np.asarray(src_aligned.compute_point_cloud_distance(tgt), dtype=float)
+
+    metrics = {
+        "fitness": float(reg.fitness),
+        "rmse_mm": float(reg.inlier_rmse),
+        "mean_mm": float(d.mean()) if d.size else float("nan"),
+        "median_mm": float(np.median(d)) if d.size else float("nan"),
+        "p95_mm": float(np.percentile(d, 95)) if d.size else float("nan"),
+        "max_mm": float(d.max()) if d.size else float("nan"),
+    }
+
+    # Apply the same transformation to the ORIGINAL face mesh (not centered).
+    # NOTE: Our ICP was done after centering, so we need to reproduce that same centering on the mesh.
+    # We do this by: (face - face_center) * T + ct_center
+    face_center = np.array(face.get_center(), dtype=float)
+    ct_center = np.array(ct.get_center(), dtype=float)
+
+    # Build 4x4 that does: translate(-face_center) -> apply ICP -> translate(+ct_center)
+    T = np.array(reg.transformation, dtype=float)
+    A = np.eye(4)
+    A[:3, 3] = -face_center
+    B = np.eye(4)
+    B[:3, 3] = ct_center
+    T_world = B @ T @ A
+
+    face_aligned = o3d.geometry.TriangleMesh(face)
+    face_aligned.transform(T_world)
+    o3d.io.write_triangle_mesh(out_face_in_ct_stl, face_aligned)
+    print(f"[align] wrote: {out_face_in_ct_stl}")
+
+    return metrics
+
+
+def write_metrics_csv(path: str, row: dict) -> None:
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        w.writeheader()
+        w.writerow(row)
+
+
+# ------------------------
+# CLI
+# ------------------------
+def main() -> None:
+    ap = argparse.ArgumentParser(description="One-command Face–CT Alignment runner")
+    ap.add_argument("--case", required=True, help="Case folder (e.g., cases/P001)")
+    ap.add_argument("--hu_threshold", type=int, default=-500, help="HU threshold for CT skin extraction (default: -500)")
+    ap.add_argument("--icp_threshold_mm", type=float, default=30.0, help="ICP max correspondence distance (mm)")
+    ap.add_argument("--pass_median_mm", type=float, default=5.0, help="PASS if median error <= this (mm)")
+    ap.add_argument("--pass_fitness", type=float, default=0.90, help="PASS if fitness >= this")
+    args = ap.parse_args()
+
+    case_dir = Path(args.case)
+    dicom_dir = case_dir / "ct_dicom"
+    face_path = case_dir / "face_scan.ply"  # keep it simple; PI can rename to this
+    if not dicom_dir.is_dir():
+        raise RuntimeError(f"Missing ct_dicom folder: {dicom_dir}")
+    if not face_path.is_file():
+        raise RuntimeError(f"Missing face_scan.ply: {face_path}")
+
+    print("[case]", str(case_dir))
+
+    ct_skin_path = case_dir / "ct_skin.stl"
+    face_in_ct_path = case_dir / "face_in_ct.stl"
+    metrics_path = case_dir / "alignment_metrics.csv"
+    result_path = case_dir / "RESULT.txt"
+
+    # 1) Extract CT skin mesh
+    series_id, shape_zyx, spacing_xyz = extract_ct_skin_stl(
+        str(dicom_dir),
+        str(ct_skin_path),
+        series_id=None,
+        hu_threshold=args.hu_threshold,
+    )
+
+    # 2) Align face to CT skin
+    metrics = align_face_to_ct_skin(
+        str(face_path),
+        str(ct_skin_path),
+        str(face_in_ct_path),
+        sample_points=60000,
+        icp_threshold_mm=float(args.icp_threshold_mm),
+    )
+
+    # add some provenance fields
+    metrics_full = {
+        "case": case_dir.name,
+        "series_id": series_id,
+        "ct_shape_zyx": str(shape_zyx),
+        "ct_spacing_xyz_mm": str(spacing_xyz),
+        **metrics,
+    }
+
+    # 3) Save metrics + PASS/FAIL
+    write_metrics_csv(str(metrics_path), metrics_full)
+
+    passed = (metrics["median_mm"] <= args.pass_median_mm) and (metrics["fitness"] >= args.pass_fitness)
+    decision = "PASS" if passed else "FAIL"
+    result_path.write_text(decision)
+
+    # Summary
+    print("\n=== RESULT ===")
+    print("Decision:", decision)
+    for k in ["fitness", "rmse_mm", "mean_mm", "median_mm", "p95_mm", "max_mm"]:
+        print(f"{k}: {metrics[k]:.2f}")
+    print("\nOutputs written to:", str(case_dir))
+    print("  -", ct_skin_path.name)
+    print("  -", face_in_ct_path.name)
+    print("  -", metrics_path.name)
+    print("  -", result_path.name)
+    print("\n3D Slicer quick check:")
+    print("  1) Import DICOM from:", dicom_dir)
+    print("  2) Add Models:", ct_skin_path, "and", face_in_ct_path)
+
+
+if __name__ == "__main__":
+    main()
